@@ -11,10 +11,10 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os 
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from pymongo import MongoClient
 
@@ -25,6 +25,7 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
 
 def to_ms(dt):
@@ -40,7 +41,32 @@ def from_ms(ms):
     """Epoch milliseconds -> tz-aware UTC datetime."""
     return EPOCH + timedelta(milliseconds=ms)
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+def history_out(h: dict) -> dict:
+    """One stored history entry -> API shape. punch_in/punch_out from/to are BSON dates -> epoch ms."""
+    changes = {}
+    for field, ch in h.get("changes", {}).items():
+        if field in ("punch_in", "punch_out"):
+            changes[field] = {"from": to_ms(ch.get("from")), "to": to_ms(ch.get("to"))}
+        else:
+            changes[field] = {"from": ch.get("from"), "to": ch.get("to")}
+    return {"at": to_ms(h["at"]), "by": h["by"], "reason": h["reason"], "changes": changes}
+
+
+def record_out(doc: dict) -> dict:
+    """Stored attendance document -> API shape: epoch ms, legacy gaps filled, no _id."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": to_ms(doc.get("punch_in")),
+        "punch_out": to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": [history_out(h) for h in doc.get("history") or []],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +109,40 @@ def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str
         day -= timedelta(days=1)
     return day.isoformat()
 
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+
+
+def parse_date(value: str, name: str) -> str:
+    """Strict YYYY-MM-DD calendar date, else 422. Returns the same string."""
+    try:
+        if len(value) != 10:
+            raise ValueError
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(422, f"{name} must be a valid YYYY-MM-DD date")
+    return value
+
+
+def attendance_query(emp_code, date_from, date_to, status) -> dict:
+    """Build the MongoDB filter for GET /attendance (also reused by the explain endpoint)."""
+    q = {}
+    if emp_code is not None:
+        q["emp_code"] = emp_code
+    if date_from is not None:
+        parse_date(date_from, "date_from")
+    if date_to is not None:
+        parse_date(date_to, "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+    if date_from is not None or date_to is not None:
+        q["date"] = {}
+        if date_from is not None:
+            q["date"]["$gte"] = date_from
+        if date_to is not None:
+            q["date"]["$lte"] = date_to
+    if status is not None:
+        q["status"] = status
+    return q
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -163,29 +223,19 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
-
+    q = attendance_query(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
