@@ -9,23 +9,46 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os 
+from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def ensure_indexes():
+    """Create every index the app needs. Safe to run on each startup (same spec = no-op)."""
+    db.employees.create_index("emp_code", unique=True, name="emp_code_unique")
+    db.employees.create_index([("department", 1), ("emp_code", 1)], name="dept_emp_code")
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="emp_date_unique")
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="date_desc_emp")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        ensure_indexes()
+    except PyMongoError as exc:
+        print("WARNING: could not create indexes:", exc)
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 def to_ms(dt):
@@ -147,14 +170,32 @@ def attendance_query(emp_code, date_from, date_to, status) -> dict:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+HHMM = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(pattern=r"^EMP[0-9]{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=HHMM)
+    shift_end: str = Field("18:30", pattern=HHMM)
     joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def _valid_joined_on(cls, v):
+        try:
+            parse_date(v, "joined_on")
+        except HTTPException:
+            raise ValueError("joined_on must be a valid YYYY-MM-DD date")
+        return v
+
+    @model_validator(mode="after")
+    def _shift_times_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -168,29 +209,78 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except PyMongoError:
+        raise HTTPException(503, "MongoDB is not reachable")
     return {"status": "ok"}
+
+
+def employee_out(doc: dict) -> dict:
+    """Stored employee document -> API shape: created_at in epoch ms, no _id."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": to_ms(doc["created_at"]),
+    }
+
+
+def employee_out(doc: dict) -> dict:
+    """Stored employee document -> API shape: created_at in epoch ms, no _id."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": to_ms(doc["created_at"]),
+    }
+
+
+def employee_out(doc: dict) -> dict:
+    """Stored employee document -> API shape: created_at in epoch ms, no _id."""
+    return {
+        "emp_code": doc["emp_code"],
+        "name": doc["name"],
+        "email": doc["email"],
+        "department": doc["department"],
+        "shift_start": doc["shift_start"],
+        "shift_end": doc["shift_end"],
+        "joined_on": doc["joined_on"],
+        "created_at": to_ms(doc["created_at"]),
+    }
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = from_ms(to_ms(datetime.now(timezone.utc)))
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_out(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
     q = {}
-    if department:
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    total = db.employees.count_documents(q)
+    cursor = db.employees.find(q).sort("emp_code", 1).skip((page - 1) * page_size).limit(page_size)
+    return {"items": [employee_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
