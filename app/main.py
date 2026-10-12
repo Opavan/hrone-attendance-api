@@ -619,3 +619,38 @@ def department_summary(month: str, department: Optional[str] = None):
             "on_duty_count": r["on_duty_count"],
         })
     return {"month": month, "items": items}
+
+
+def late_leaderboard_pipeline(first: str, last: str, limit: int, department: Optional[str] = None) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": first, "$lte": last}, "late_minutes": {"$gt": 0}}},
+        {"$group": {"_id": "$emp_code", "total_late_minutes": {"$sum": "$late_minutes"}, "late_count": {"$sum": 1}}},
+        # logs whose employee does not exist are dropped by the $unwind (no match -> empty array)
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})  # rank inside this department only
+    pipeline += [
+        # $rank = standard competition ranking: ties share a rank, the next rank is skipped (1, 2, 2, 4)
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},  # limit applies after ranking, so ties can exceed it
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$emp.name",
+            "department": "$emp.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: str, limit: int = Query(10, ge=1, le=50), department: Optional[str] = None):
+    first, last = month_bounds(month)
+    items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(first, last, limit, department)))
+    return {"month": month, "items": items}
