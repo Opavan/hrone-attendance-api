@@ -11,6 +11,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 import calendar
 import re 
+import json
+from bson import json_util
 from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
@@ -39,6 +41,9 @@ def ensure_indexes():
     db.employees.create_index([("department", 1), ("emp_code", 1)], name="dept_emp_code")
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True, name="emp_date_unique")
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)], name="date_desc_emp")
+    db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)], name="status_date_emp")
+    db.employees.create_index("joined_on", name="joined_on")
+    db.employees.create_index([("department", 1), ("joined_on", 1)], name="dept_joined")
 
 
 @asynccontextmanager
@@ -168,6 +173,7 @@ def attendance_query(emp_code, date_from, date_to, status) -> dict:
     if status is not None:
         q["status"] = status
     return q
+ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -343,7 +349,7 @@ def list_attendance(
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q)
-        .sort([("date", -1), ("emp_code", 1)])
+        .sort(ATTENDANCE_SORT)
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
@@ -739,3 +745,171 @@ def department_trend(
             "moving_avg_7d": round_half_up(Decimal(int(round(r["win_sum"]))) / Decimal(win_count) / 10000, 4) if win_count else None,
         })
     return {"department": department, "items": items}
+
+
+
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from_trend: Optional[str] = Query(None, alias="from"),
+    date_to_trend: Optional[str] = Query(None, alias="to"),
+):
+    """
+    Return MongoDB's execution plan for a supported endpoint.
+
+    Supported endpoint values:
+    attendance_list, employee_monthly, department_summary,
+    late_leaderboard, department_trend
+    """
+    try:
+        if endpoint in ("attendance_list", "attendance"):
+            query = attendance_query(
+                emp_code, date_from, date_to, status
+            )
+            plan = (
+                db.attendance_logs
+                .find(query)
+                .sort(ATTENDANCE_SORT)
+                .explain()
+            )
+
+        elif endpoint == "employee_monthly":
+            if not emp_code:
+                raise HTTPException(422, "emp_code is required")
+            if not month:
+                raise HTTPException(422, "month is required")
+
+            first, last = month_bounds(month)
+            pipeline = employee_monthly_pipeline(
+                emp_code, first, last
+            )
+
+            plan = db.command(
+                "explain",
+                {
+                    "aggregate": "attendance_logs",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                verbosity="executionStats",
+            )
+
+        elif endpoint == "department_summary":
+            if not month:
+                raise HTTPException(422, "month is required")
+
+            first, last = month_bounds(month)
+            pipeline = department_summary_pipeline(
+                first, last, department
+            )
+
+            plan = db.command(
+                "explain",
+                {
+                    "aggregate": "employees",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                verbosity="executionStats",
+            )
+
+        elif endpoint == "late_leaderboard":
+            if not month:
+                raise HTTPException(422, "month is required")
+
+            first, last = month_bounds(month)
+            pipeline = late_leaderboard_pipeline(
+                first, last, limit, department
+            )
+
+            plan = db.command(
+                "explain",
+                {
+                    "aggregate": "attendance_logs",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                verbosity="executionStats",
+            )
+
+        elif endpoint == "department_trend":
+            if not department:
+                raise HTTPException(422, "department is required")
+
+            if not date_from_trend or not date_to_trend:
+                raise HTTPException(422, "from and to are required")
+
+            parse_date(date_from_trend, "from")
+            parse_date(date_to_trend, "to")
+
+            d0 = datetime.strptime(date_from_trend, "%Y-%m-%d")
+            d1 = datetime.strptime(date_to_trend, "%Y-%m-%d")
+
+            if d1 < d0:
+                raise HTTPException(
+                    422, "to must not be before from"
+                )
+
+            if (d1 - d0).days + 1 > 92:
+                raise HTTPException(
+                    422, "range must not exceed 92 days"
+                )
+
+            emps = list(
+                db.employees.find(
+                    {"department": department},
+                    {
+                        "_id": 0,
+                        "emp_code": 1,
+                        "joined_on": 1,
+                    },
+                )
+            )
+
+            if not emps:
+                raise HTTPException(404, "department not found")
+
+            pipeline = department_trend_pipeline(
+                [e["emp_code"] for e in emps],
+                sorted(e["joined_on"] for e in emps),
+                date_from_trend,
+                date_to_trend,
+            )
+
+            plan = db.command(
+                "explain",
+                {
+                    "aggregate": "attendance_logs",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                verbosity="executionStats",
+            )
+
+        else:
+            raise HTTPException(
+                422,
+                "Unsupported endpoint. Use attendance_list, "
+                "employee_monthly, department_summary, "
+                "late_leaderboard, or department_trend.",
+            )
+
+        return json.loads(json_util.dumps(plan))
+
+    except HTTPException:
+        raise
+
+    except PyMongoError as exc:
+        raise HTTPException(
+            500,
+            f"MongoDB explain failed: {str(exc)}",
+        )
