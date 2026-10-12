@@ -210,6 +210,17 @@ class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
 
+class RegularizeIn(BaseModel):
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
+PRESENCE = ("PRESENT", "WFH", "ON_DUTY")
+TRACKED = ("status", "punch_in", "punch_out", "late_minutes", "work_hours", "overtime_minutes", "half_day")
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -377,4 +388,80 @@ def punch_out(body: PunchOutIn):
     )
     if updated is None:
         raise HTTPException(409, "already punched out")
+    return record_out(updated)
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    parse_date(date, "date")
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # stored state (legacy documents may lack some fields)
+    old = {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "work_hours": rec.get("work_hours"),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+    # omitted fields are unchanged; supplied instants are truncated to whole seconds (R1)
+    status = body.status or old["status"]
+    p_in = from_ms(body.punch_in).replace(microsecond=0) if body.punch_in is not None else old["punch_in"]
+    p_out = from_ms(body.punch_out).replace(microsecond=0) if body.punch_out is not None else old["punch_out"]
+
+    if status in PRESENCE:
+        if p_in is None:
+            raise HTTPException(422, "a presence status requires a punch_in")
+        if attendance_date(p_in, emp["shift_start"], emp["shift_end"]) != date:
+            raise HTTPException(422, "punch_in must fall on the record's attendance date")
+        if p_out is not None and (p_out <= p_in or p_out - p_in > timedelta(hours=24)):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours of it")
+    else:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT and LEAVE records cannot have punch times")
+        p_in = p_out = None
+
+    # recompute derived fields from the final times (R2-R5)
+    late = compute_late_minutes(p_in, emp["shift_start"], date) if p_in is not None else 0
+    if p_out is not None:
+        work_hours = compute_work_hours(p_in, p_out)
+        overtime = compute_overtime(p_out, emp["shift_start"], emp["shift_end"], date)
+        half_day = work_hours < 4.50
+    else:
+        work_hours, overtime, half_day = None, 0, False
+    new = {
+        "status": status, "punch_in": p_in, "punch_out": p_out, "late_minutes": late,
+        "work_hours": work_hours, "overtime_minutes": overtime, "half_day": half_day,
+    }
+
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED if old[f] != new[f]}
+    if not any(f in changes for f in ("status", "punch_in", "punch_out")):
+        raise HTTPException(422, "request changes nothing")
+
+    # optimistic concurrency: write only if nobody changed the record since we read it
+    history = rec.get("history")
+    guard = {
+        "_id": rec["_id"],
+        "status": old["status"],
+        "punch_in": old["punch_in"],
+        "punch_out": old["punch_out"],
+        "history": {"$size": len(history)} if history is not None else {"$exists": False},
+    }
+    entry = {
+        "at": from_ms(to_ms(datetime.now(timezone.utc))),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        guard, {"$set": new, "$push": {"history": entry}}, return_document=ReturnDocument.AFTER
+    )
+    if updated is None:
+        raise HTTPException(409, "record was modified concurrently; retry")
     return record_out(updated)
