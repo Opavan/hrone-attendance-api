@@ -549,3 +549,73 @@ def employee_monthly(emp_code: str, month: str):
         "total_overtime_minutes": stats.get("total_overtime_minutes", 0),
         "attendance_pct": pct,
     }
+
+
+
+def department_summary_pipeline(first: str, last: str, department: Optional[str] = None) -> list:
+    """Starts from employees (so people with zero logs still count, R9), joins that month's logs,
+    groups per employee, then per department."""
+    emp_match = {"joined_on": {"$lte": last}}
+    if department is not None:
+        emp_match["department"] = department
+    is_present = {"$in": ["$logs.status", list(PRESENCE)]}
+    on_weekday = {"$eq": [{"$in": ["$logs.date", weekend_dates(first, last)]}, False]}
+    has_hours = {"$and": [is_present, {"$gt": ["$logs.work_hours", None]}]}
+
+    def one_if(cond):
+        return {"$cond": [cond, 1, 0]}
+
+    return [
+        {"$match": emp_match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [{"$match": {"date": {"$gte": first, "$lte": last}}}],
+            "as": "logs",
+        }},
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {"$group": {
+            "_id": {"department": "$department", "emp_code": "$emp_code"},
+            "present_days": {"$sum": {"$cond": [{"$and": [is_present, on_weekday]}, {"$cond": ["$logs.half_day", 0.5, 1]}, 0]}},
+            "work_hundredths": {"$sum": {"$cond": [has_hours, {"$multiply": ["$logs.work_hours", 100]}, 0]}},
+            "work_records": {"$sum": one_if(has_hours)},
+            "late_count": {"$sum": one_if({"$gt": ["$logs.late_minutes", 0]})},
+            "total_late_minutes": {"$sum": "$logs.late_minutes"},
+            "leave_count": {"$sum": one_if({"$eq": ["$logs.status", "LEAVE"]})},
+            "on_duty_count": {"$sum": one_if({"$eq": ["$logs.status", "ON_DUTY"]})},
+        }},
+        {"$group": {
+            "_id": "$_id.department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$present_days"},
+            "work_hundredths": {"$sum": "$work_hundredths"},
+            "work_records": {"$sum": "$work_records"},
+            "late_count": {"$sum": "$late_count"},
+            "total_late_minutes": {"$sum": "$total_late_minutes"},
+            "leave_count": {"$sum": "$leave_count"},
+            "on_duty_count": {"$sum": "$on_duty_count"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str, department: Optional[str] = None):
+    first, last = month_bounds(month)
+    items = []
+    for r in db.employees.aggregate(department_summary_pipeline(first, last, department)):
+        n = int(r["work_records"])
+        # work hours are summed as whole hundredths, so the average is exact and rounded half-up (R8)
+        avg = round_half_up(Decimal(int(round(r["work_hundredths"]))) / Decimal(n) / 100) if n else None
+        items.append({
+            "department": r["_id"],
+            "headcount": r["headcount"],
+            "present_days": float(r["present_days"]),
+            "avg_work_hours": avg,
+            "late_count": r["late_count"],
+            "total_late_minutes": r["total_late_minutes"],
+            "leave_count": r["leave_count"],
+            "on_duty_count": r["on_duty_count"],
+        })
+    return {"month": month, "items": items}
