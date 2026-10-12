@@ -654,3 +654,88 @@ def late_leaderboard(month: str, limit: int = Query(10, ge=1, le=50), department
     first, last = month_bounds(month)
     items = list(db.attendance_logs.aggregate(late_leaderboard_pipeline(first, last, limit, department)))
     return {"month": month, "items": items}
+
+
+def department_trend_pipeline(codes: list, joined: list, frm: str, to: str) -> list:
+    """Daily trend over the department's logs. Everything per day is computed inside MongoDB:
+    $densify fills missing days, $setWindowFields gives the 7-row moving window."""
+    lo = datetime.strptime(frm, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    hi = datetime.strptime(to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)  # upper bound is exclusive
+    is_present = {"$in": ["$status", list(PRESENCE)]}
+    return [
+        {"$match": {"emp_code": {"$in": codes}, "date": {"$gte": frm, "$lte": to}}},
+        {"$group": {
+            "_id": "$date",
+            # presence counted in halves (full day = 2, half day = 1) so every later step is exact integer maths
+            "present_halves": {"$sum": {"$cond": [is_present, {"$cond": ["$half_day", 1, 2]}, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+        }},
+        {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
+        {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [lo, hi]}}},
+        {"$addFields": {
+            "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
+            "present_halves": {"$ifNull": ["$present_halves", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+            "is_working_day": {"$in": [{"$dayOfWeek": "$day"}, [2, 3, 4, 5, 6]]},
+        }},
+        {"$addFields": {"headcount": {"$size": {"$filter": {
+            "input": joined, "as": "j", "cond": {"$lte": ["$$j", "$date"]},
+        }}}}},
+        # attendance_rate in whole ten-thousandths, rounded half-up with integer maths:
+        # floor((halves * 10000 + headcount) / (2 * headcount)); null unless a working day with headcount > 0
+        {"$addFields": {"rate_10000": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$floor": {"$divide": [
+                {"$add": [{"$multiply": ["$present_halves", 10000]}, "$headcount"]},
+                {"$multiply": [2, "$headcount"]},
+            ]}},
+            None,
+        ]}}},
+        {"$addFields": {"has_rate": {"$cond": [{"$eq": ["$rate_10000", None]}, 0, 1]}}},
+        {"$setWindowFields": {"sortBy": {"day": 1}, "output": {
+            "win_sum": {"$sum": "$rate_10000", "window": {"documents": [-6, 0]}},
+            "win_count": {"$sum": "$has_rate", "window": {"documents": [-6, 0]}},
+        }}},
+        {"$sort": {"day": 1}},
+        {"$project": {
+            "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1, "present_halves": 1,
+            "late_count": 1, "rate_10000": 1, "win_sum": 1, "win_count": 1,
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+):
+    parse_date(date_from, "from")
+    parse_date(date_to, "to")
+    d0 = datetime.strptime(date_from, "%Y-%m-%d")
+    d1 = datetime.strptime(date_to, "%Y-%m-%d")
+    if d1 < d0:
+        raise HTTPException(422, "to must not be before from")
+    if (d1 - d0).days + 1 > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "department not found")
+    pipeline = department_trend_pipeline(
+        [e["emp_code"] for e in emps], sorted(e["joined_on"] for e in emps), date_from, date_to
+    )
+    items = []
+    for r in db.attendance_logs.aggregate(pipeline):
+        rate = r.get("rate_10000")
+        win_count = int(round(r["win_count"]))
+        items.append({
+            "date": r["date"],
+            "is_working_day": r["is_working_day"],
+            "headcount": r["headcount"],
+            "present_count": r["present_halves"] / 2,
+            "late_count": r["late_count"],
+            "attendance_rate": float(Decimal(int(round(rate))) / 10000) if rate is not None else None,
+            # mean of the rounded rates in the window, exact and half-up to 4 decimals (R8)
+            "moving_avg_7d": round_half_up(Decimal(int(round(r["win_sum"]))) / Decimal(win_count) / 10000, 4) if win_count else None,
+        })
+    return {"department": department, "items": items}
