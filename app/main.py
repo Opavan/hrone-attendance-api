@@ -8,7 +8,9 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
-import os 
+import os
+import calendar
+import re 
 from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
@@ -465,3 +467,85 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     if updated is None:
         raise HTTPException(409, "record was modified concurrently; retry")
     return record_out(updated)
+
+
+
+def month_bounds(month: str):
+    """Validate YYYY-MM -> (first_day, last_day) as 'YYYY-MM-DD' strings. 422 on bad input."""
+    if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month) or month.startswith("0000"):
+        raise HTTPException(422, "month must be a valid YYYY-MM")
+    y, m = int(month[:4]), int(month[5:])
+    return f"{month}-01", f"{month}-{calendar.monthrange(y, m)[1]:02d}"
+
+
+def count_working_days(first: str, last: str, joined_on: str) -> int:
+    """R7: Mon-Fri days from max(first, joined_on) to last, inclusive."""
+    start = datetime.strptime(max(first, joined_on), "%Y-%m-%d").date()
+    end = datetime.strptime(last, "%Y-%m-%d").date()
+    n = 0
+    while start <= end:
+        if start.weekday() < 5:
+            n += 1
+        start += timedelta(days=1)
+    return n
+
+
+def round_half_up(value, places: int = 2) -> float:
+    """R8: half-up rounding done in Decimal (never float rounding)."""
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    return float(d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
+
+
+def weekend_dates(first: str, last: str) -> list:
+    """Every Saturday/Sunday between first and last (inclusive) as 'YYYY-MM-DD' strings."""
+    d = datetime.strptime(first, "%Y-%m-%d").date()
+    end = datetime.strptime(last, "%Y-%m-%d").date()
+    out = []
+    while d <= end:
+        if d.weekday() >= 5:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def employee_monthly_pipeline(emp_code: str, first: str, last: str) -> list:
+    """One employee, one month. Present counts only Mon-Fri; half day = 0.5 (R5-R7)."""
+    on_weekday = {"$eq": [{"$in": ["$date", weekend_dates(first, last)]}, False]}
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first, "$lte": last}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [{"$in": ["$status", list(PRESENCE)]}, on_weekday]},
+                {"$cond": ["$half_day", 0.5, 1]},
+                0,
+            ]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": "$late_minutes"},
+            "total_overtime_minutes": {"$sum": "$overtime_minutes"},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str):
+    first, last = month_bounds(month)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    stats = next(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, first, last)), None) or {}
+    working_days = count_working_days(first, last, emp["joined_on"])
+    present = stats.get("present_days", 0)
+    pct = round_half_up(Decimal(str(present)) / Decimal(working_days) * 100) if working_days > 0 else None
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": float(present),
+        "leave_days": stats.get("leave_days", 0),
+        "late_count": stats.get("late_count", 0),
+        "total_late_minutes": stats.get("total_late_minutes", 0),
+        "total_overtime_minutes": stats.get("total_overtime_minutes", 0),
+        "attendance_pct": pct,
+    }
