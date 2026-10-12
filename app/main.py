@@ -12,12 +12,12 @@ import os
 from contextlib import asynccontextmanager
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
-from pymongo import MongoClient
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
@@ -198,10 +198,17 @@ class EmployeeIn(BaseModel):
         return self
 
 
+EpochMs = Annotated[StrictInt, Field(ge=100000000000, le=4102444800000)]
+
+
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -286,10 +293,11 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = from_ms(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc)
+    ts = ts.replace(microsecond=0)  # R1: truncate to whole seconds, store the truncated value
+    d = attendance_date(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -297,15 +305,16 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)  # unique index (emp_code, date) decides the race
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return record_out(doc)
 
 
 @app.get("/attendance")
@@ -337,3 +346,35 @@ def list_attendance(
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = from_ms(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc)
+    ts = ts.replace(microsecond=0)
+    # most recent record opened at or before punched_at (works across midnight for overnight shifts)
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", -1)]
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec["punch_out"] is not None:
+        raise HTTPException(409, "already punched out")
+    if ts <= rec["punch_in"] or ts - rec["punch_in"] > timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+    work_hours = compute_work_hours(rec["punch_in"], ts)
+    # one atomic update: only succeeds while punch_out is still null, so simultaneous requests yield one 200
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": work_hours,
+            "overtime_minutes": compute_overtime(ts, emp["shift_start"], emp["shift_end"], rec["date"]),
+            "half_day": work_hours < 4.50,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
