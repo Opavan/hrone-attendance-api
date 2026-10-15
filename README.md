@@ -35,13 +35,14 @@ Every endpoint in `openapi.yaml`: `/health`, `POST` and `GET /employees`, `POST 
 
 ## How I tested
 
-- Expected values for the analytics were computed with a separate plain-Python script from the sample data (plus extra records I created), then compared with the API's output.
-- I checked each rule with `curl` against MongoDB Atlas: rounding ties, overnight shifts, half days, mid-month joiners, ranking ties, empty ranges, and the 404 and 422 cases.
+- The expected analytics values were computed with a separate plain-Python script from the sample data (plus extra records I created), then compared with the API's output on MongoDB Atlas.
+- Through the API with `curl`: punch-in lateness (09:40:01 gives 10 minutes), punch-out, a half-up rounding tie in a correction (9.175 hours gives 9.18), history appending, duplicate punch-in and punch-out returning 409, mid-month joiners, half days, leaderboard ties and `limit`, a trend over a range with no records, and the 404 and 422 cases.
+- The helper functions (late, work hours, overtime, attendance date) were checked with direct Python calls. Overnight-shift handling was verified that way, not through the HTTP endpoints.
 - `/admin/explain/...` shows `IXSCAN` and no `COLLSCAN` for all five endpoints.
 
 ## Limits of my testing
 
-- I did not load-test with ~100,000 records, so the index plans are checked but not timed.
+- I did not load-test with about 100,000 records, so the index plans are checked but not timed.
 - Race protection (duplicate punch-in, punch-out, concurrent PATCH) rests on the unique index, an atomic conditional update and an optimistic guard. I did not run true parallel requests against it.
 
 ## Assumptions
