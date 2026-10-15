@@ -1,21 +1,11 @@
 # DECISIONS.md
 
-## 1. Indexes
+1. **Indexes.** `employees.emp_code` is unique, so no two employees share a code. `employees(department, emp_code)` serves the filtered, sorted employee list. `attendance_logs(emp_code, date)` is unique and serves punch-in, the monthly summary and the trend. `attendance_logs(date desc, emp_code)` serves the attendance list and the leaderboard's date range. `attendance_logs(status, date desc, emp_code)` serves status filters, and `employees(joined_on)` and `(department, joined_on)` serve headcount. I rejected an index on `late_minutes`: queries filter by date first, so it would only slow writes.
 
-I created a unique index on `employees.emp_code` to prevent duplicate employee codes. A compound index on `department` and `emp_code` supports department-filtered employee listings. A unique compound index on `attendance_logs.emp_code` and `date` guarantees one attendance record per employee per day. An index on `date` descending and `emp_code` ascending supports attendance listing. I would avoid adding indexes without a query or uniqueness requirement because they increase write costs.
+2. **Punch-in race.** The code finds the employee, works out the IST date, then inserts without checking first. Both requests reach `insert_one`; the unique `(emp_code, date)` index lets one succeed, and the other gets a duplicate-key error, which becomes 409. The database decides the winner, not my code.
 
-## 2. Punch-in race
+3. **Ties.** The leaderboard uses `$rank`, so tied employees share a rank (1, 2, 2, 4), then keeps `rank <= limit`. Both tied employees are returned, so there can be more rows than `limit`.
 
-If two identical punch-in requests arrive together, both may initially find that no record exists. The unique compound index allows only one insert to succeed. The other insert raises a duplicate-key error, which the API converts into HTTP 409 Conflict.
+4. **Headcount.** The summary starts from `employees` (joined on or before month end), looks up that month's logs, and unwinds with `preserveNullAndEmptyArrays`. An employee with no logs survives and is counted.
 
-## 3. Ties
-
-The leaderboard uses competition ranking. Employees tied on late minutes receive the same rank. Because the limit is applied to rank rather than simply the number of returned documents, ties at the cutoff can produce more results than the requested limit.
-
-## 4. Headcount
-
-The department summary starts from employees, not attendance logs. It includes employees who joined on or before the reporting period ends, then looks up their attendance records. Employees with no logs are therefore still counted.
-
-## 5. Scaling 100x
-
-I would benchmark with a production-sized dataset, inspect execution plans, and monitor slow queries. I would then optimize indexes and aggregation pipelines based on measured bottlenecks rather than adding indexes blindly.
+5. **At 100x.** I would store a pre-computed daily summary per department, updated on each punch, so trend and summary stop scanning logs.
