@@ -373,11 +373,28 @@ def punch_out(body: PunchOutIn):
     ts = from_ms(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc)
     ts = ts.replace(microsecond=0)
     # most recent record opened at or before punched_at (works across midnight for overnight shifts)
+       # Prefer the most recent record that is still open.
     rec = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", -1)]
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$lte": ts},
+            "punch_out": None,
+        },
+        sort=[("punch_in", -1)],
     )
+
     if rec is None:
-        raise HTTPException(404, "no punch-in found")
+        # Check whether a previous punch-in was already closed.
+        previous = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "punch_in": {"$lte": ts},
+            },
+            sort=[("punch_in", -1)],
+        )
+        if previous is not None and previous.get("punch_out") is not None:
+            raise HTTPException(409, "already punched out")
+        raise HTTPException(404, "no open punch-in found")
     if rec["punch_out"] is not None:
         raise HTTPException(409, "already punched out")
     if ts <= rec["punch_in"] or ts - rec["punch_in"] > timedelta(hours=24):
@@ -543,7 +560,7 @@ def employee_monthly(emp_code: str, month: str):
     stats = next(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, first, last)), None) or {}
     working_days = count_working_days(first, last, emp["joined_on"])
     present = stats.get("present_days", 0)
-    pct = round_half_up(Decimal(str(present)) / Decimal(working_days) * 100) if working_days > 0 else None
+    pct = round_half_up(Decimal(str(present)) / Decimal(working_days) * 100, 4) if working_days > 0 else None
     return {
         "emp_code": emp_code,
         "month": month,
@@ -676,6 +693,23 @@ def department_trend_pipeline(codes: list, joined: list, frm: str, to: str) -> l
             "present_halves": {"$sum": {"$cond": [is_present, {"$cond": ["$half_day", 1, 2]}, 0]}},
             "late_count": {"$sum": {"$cond": [{"$gt": ["$late_minutes", 0]}, 1, 0]}},
         }},
+                {"$unionWith": {
+            "coll": "employees",
+            "pipeline": [
+                {"$match": {"emp_code": {"$in": codes}}},
+                {"$limit": 1},
+                {"$project": {
+                    "_id": {"$literal": frm},
+                    "present_halves": {"$literal": 0},
+                    "late_count": {"$literal": 0},
+                }},
+            ],
+        }},
+        {"$group": {
+            "_id": "$_id",
+            "present_halves": {"$sum": "$present_halves"},
+            "late_count": {"$sum": "$late_count"},
+        }},
         {"$addFields": {"day": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
         {"$densify": {"field": "day", "range": {"step": 1, "unit": "day", "bounds": [lo, hi]}}},
         {"$addFields": {
@@ -750,166 +784,78 @@ def department_trend(
 
 
 
+def build_trend_pipeline(department: str, date_from: str, date_to: str) -> list:
+    """Validate a trend request and build its pipeline (shared by the endpoint and /admin/explain)."""
+    parse_date(date_from, "from")
+    parse_date(date_to, "to")
+    d0 = datetime.strptime(date_from, "%Y-%m-%d")
+    d1 = datetime.strptime(date_to, "%Y-%m-%d")
+    if d1 < d0:
+        raise HTTPException(422, "to must not be before from")
+    if (d1 - d0).days + 1 > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "department not found")
+    return department_trend_pipeline(
+        [e["emp_code"] for e in emps], sorted(e["joined_on"] for e in emps), date_from, date_to
+    )
+
+
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(
-    endpoint: str,
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[Status] = None,
     month: Optional[str] = None,
     department: Optional[str] = None,
     limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
     date_from_trend: Optional[str] = Query(None, alias="from"),
     date_to_trend: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
-    """
-    Return MongoDB's execution plan for a supported endpoint.
+    def need(value, name):
+        if value is None:
+            raise HTTPException(422, f"{name} is required")
+        return value
 
-    Supported endpoint values:
-    attendance_list, employee_monthly, department_summary,
-    late_leaderboard, department_trend
-    """
-    try:
-        if endpoint in ("attendance_list", "attendance"):
-            query = attendance_query(
-                emp_code, date_from, date_to, status
-            )
-            plan = (
-                db.attendance_logs
-                .find(query)
-                .sort(ATTENDANCE_SORT)
-                .explain()
-            )
-
-        elif endpoint == "employee_monthly":
-            if not emp_code:
-                raise HTTPException(422, "emp_code is required")
-            if not month:
-                raise HTTPException(422, "month is required")
-
-            first, last = month_bounds(month)
-            pipeline = employee_monthly_pipeline(
-                emp_code, first, last
-            )
-
-            plan = db.command(
-                "explain",
-                {
-                    "aggregate": "attendance_logs",
-                    "pipeline": pipeline,
-                    "cursor": {},
-                },
-                verbosity="executionStats",
-            )
-
-        elif endpoint == "department_summary":
-            if not month:
-                raise HTTPException(422, "month is required")
-
-            first, last = month_bounds(month)
-            pipeline = department_summary_pipeline(
-                first, last, department
-            )
-
-            plan = db.command(
-                "explain",
-                {
-                    "aggregate": "employees",
-                    "pipeline": pipeline,
-                    "cursor": {},
-                },
-                verbosity="executionStats",
-            )
-
-        elif endpoint == "late_leaderboard":
-            if not month:
-                raise HTTPException(422, "month is required")
-
-            first, last = month_bounds(month)
-            pipeline = late_leaderboard_pipeline(
-                first, last, limit, department
-            )
-
-            plan = db.command(
-                "explain",
-                {
-                    "aggregate": "attendance_logs",
-                    "pipeline": pipeline,
-                    "cursor": {},
-                },
-                verbosity="executionStats",
-            )
-
-        elif endpoint == "department_trend":
-            if not department:
-                raise HTTPException(422, "department is required")
-
-            if not date_from_trend or not date_to_trend:
-                raise HTTPException(422, "from and to are required")
-
-            parse_date(date_from_trend, "from")
-            parse_date(date_to_trend, "to")
-
-            d0 = datetime.strptime(date_from_trend, "%Y-%m-%d")
-            d1 = datetime.strptime(date_to_trend, "%Y-%m-%d")
-
-            if d1 < d0:
-                raise HTTPException(
-                    422, "to must not be before from"
-                )
-
-            if (d1 - d0).days + 1 > 92:
-                raise HTTPException(
-                    422, "range must not exceed 92 days"
-                )
-
-            emps = list(
-                db.employees.find(
-                    {"department": department},
-                    {
-                        "_id": 0,
-                        "emp_code": 1,
-                        "joined_on": 1,
-                    },
-                )
-            )
-
-            if not emps:
-                raise HTTPException(404, "department not found")
-
-            pipeline = department_trend_pipeline(
-                [e["emp_code"] for e in emps],
-                sorted(e["joined_on"] for e in emps),
-                date_from_trend,
-                date_to_trend,
-            )
-
-            plan = db.command(
-                "explain",
-                {
-                    "aggregate": "attendance_logs",
-                    "pipeline": pipeline,
-                    "cursor": {},
-                },
-                verbosity="executionStats",
-            )
-
-        else:
-            raise HTTPException(
-                422,
-                "Unsupported endpoint. Use attendance_list, "
-                "employee_monthly, department_summary, "
-                "late_leaderboard, or department_trend.",
-            )
-
-        return json.loads(json_util.dumps(plan))
-
-    except HTTPException:
-        raise
-
-    except PyMongoError as exc:
-        raise HTTPException(
-            500,
-            f"MongoDB explain failed: {str(exc)}",
+    # each branch builds the endpoint's own query with the endpoint's own builder
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": attendance_query(emp_code, date_from, date_to, status),
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    elif endpoint == "employee_monthly":
+        first, last = month_bounds(need(month, "month"))
+        collection = "attendance_logs"
+        command = {"aggregate": collection, "cursor": {},
+                   "pipeline": employee_monthly_pipeline(need(emp_code, "emp_code"), first, last)}
+    elif endpoint == "department_summary":
+        first, last = month_bounds(need(month, "month"))
+        collection = "employees"
+        command = {"aggregate": collection, "cursor": {},
+                   "pipeline": department_summary_pipeline(first, last, department)}
+    elif endpoint == "late_leaderboard":
+        first, last = month_bounds(need(month, "month"))
+        collection = "attendance_logs"
+        command = {"aggregate": collection, "cursor": {},
+                   "pipeline": late_leaderboard_pipeline(first, last, limit, department)}
+    else:  # department_trend
+        collection = "attendance_logs"
+        pipeline = build_trend_pipeline(
+            need(department, "department"), need(date_from_trend, "from"), need(date_to_trend, "to")
         )
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+
+    try:
+        plan = db.command("explain", command, verbosity="executionStats")
+    except PyMongoError as exc:
+        raise HTTPException(500, f"MongoDB explain failed: {exc}")
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(plan))}
